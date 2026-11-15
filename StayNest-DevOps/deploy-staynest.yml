@@ -1,0 +1,153 @@
+---
+# StayNest - deploy the React frontend (static build) to Ubuntu EC2 with Nginx
+# Usage (from Ubuntu WSL, inside the StayNest-DevOps folder):
+#   ansible-playbook deploy-staynest.yml
+
+- name: Deploy StayNest React frontend to Nginx on Ubuntu EC2
+  hosts: webservers
+  become: true
+  gather_facts: true
+
+  vars:
+    # Local React production build, as seen from Ubuntu WSL.
+    # Trailing slash = copy the CONTENTS of build/, not the folder itself.
+    staynest_local_build_dir: /mnt/c/Users/user/Desktop/frontend/StayNest-frontend/build/
+    staynest_web_root: /var/www/staynest
+    staynest_web_user: www-data
+    staynest_web_group: www-data
+    staynest_site_name: staynest
+    staynest_http_port: 80
+
+  pre_tasks:
+    - name: Check that the local React build contains index.html
+      ansible.builtin.stat:
+        path: "{{ staynest_local_build_dir }}index.html"
+      delegate_to: localhost
+      become: false
+      run_once: true
+      register: local_index
+
+    - name: Fail early if the React build folder is missing
+      ansible.builtin.assert:
+        that: local_index.stat.exists
+        fail_msg: "React build not found at {{ staynest_local_build_dir }}. Run 'npm run build' first."
+      run_once: true
+
+  tasks:
+    - name: Update apt package cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Upgrade installed apt packages (safe upgrade)
+      ansible.builtin.apt:
+        upgrade: safe
+
+    - name: Install Nginx
+      ansible.builtin.apt:
+        name: nginx
+        state: present
+
+    - name: Enable and start Nginx
+      ansible.builtin.service:
+        name: nginx
+        state: started
+        enabled: true
+
+    - name: Create StayNest web root directory
+      ansible.builtin.file:
+        path: "{{ staynest_web_root }}"
+        state: directory
+        owner: "{{ staynest_web_user }}"
+        group: "{{ staynest_web_group }}"
+        mode: "0755"
+
+    - name: Copy contents of the React build folder to the web root
+      ansible.builtin.copy:
+        src: "{{ staynest_local_build_dir }}"
+        dest: "{{ staynest_web_root }}/"
+        owner: "{{ staynest_web_user }}"
+        group: "{{ staynest_web_group }}"
+        mode: "u=rwX,g=rX,o=rX"          # dirs 0755, files 0644
+        directory_mode: "0755"
+
+    - name: Ensure ownership and permissions across the web root
+      ansible.builtin.file:
+        path: "{{ staynest_web_root }}"
+        state: directory
+        recurse: true
+        owner: "{{ staynest_web_user }}"
+        group: "{{ staynest_web_group }}"
+        mode: "u=rwX,g=rX,o=rX"
+
+    - name: Create Nginx site configuration for StayNest
+      ansible.builtin.copy:
+        dest: "/etc/nginx/sites-available/{{ staynest_site_name }}"
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # Managed by Ansible - StayNest React frontend
+          server {
+              listen {{ staynest_http_port }} default_server;
+              listen [::]:{{ staynest_http_port }} default_server;
+              server_name _;
+
+              root {{ staynest_web_root }};
+              index index.html;
+
+              # Long-term caching for hashed CRA assets
+              location /static/ {
+                  expires 1y;
+                  add_header Cache-Control "public, immutable";
+                  try_files $uri =404;
+              }
+
+              # Never cache the SPA entry point
+              location = /index.html {
+                  add_header Cache-Control "no-cache";
+              }
+
+              # React Router fallback
+              location / {
+                  try_files $uri $uri/ /index.html;
+              }
+
+              gzip on;
+              gzip_types text/plain text/css application/javascript application/json image/svg+xml;
+          }
+      notify: Validate and reload Nginx
+
+    - name: Enable StayNest site
+      ansible.builtin.file:
+        src: "/etc/nginx/sites-available/{{ staynest_site_name }}"
+        dest: "/etc/nginx/sites-enabled/{{ staynest_site_name }}"
+        state: link
+      notify: Validate and reload Nginx
+
+    - name: Disable the default Nginx site
+      ansible.builtin.file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      notify: Validate and reload Nginx
+
+  handlers:
+    # Handlers run in the order listed: the test runs first, and if it
+    # fails the play stops for that host, so the reload never happens.
+    - name: Test Nginx configuration
+      ansible.builtin.command: nginx -t
+      changed_when: false
+      listen: Validate and reload Nginx
+
+    - name: Reload Nginx
+      ansible.builtin.service:
+        name: nginx
+        state: reloaded
+      listen: Validate and reload Nginx
+
+  post_tasks:
+    - name: Verify StayNest responds on HTTP port 80
+      ansible.builtin.uri:
+        url: "http://localhost:{{ staynest_http_port }}/"
+        status_code: 200
+      changed_when: false
